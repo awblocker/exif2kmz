@@ -1,0 +1,33 @@
+To install exif2kmz, extract this directory and run:
+
+    sudo python setup.py install   # For *nix
+    python setup.py install        # For Windows
+
+This will install the script into /usr/local/bin (or the equivalent for your
+system) and your local package repository. You can then run the script via:
+
+    exif2py [options] infile1 [infile2 ...]
+
+Please note that this script requires the pyexiv2 and Python Imaging libraries,
+available from http://tilloy.net/dev/pyexiv2/index.htm and
+http://www.pythonware.com/products/pil/, respectively.
+
+The script's help is reproduced below for convenience:
+
+Usage: exif2kmz [options] infile1 [infile2 ...]
+
+Reads in images with GPS EXIF tags and outputs a KMZ file with a placemark for
+each image along with the images themselves
+
+Options:
+  -h, --help            show this help message and exit
+  -o OUTFILE            Output file for KMZ
+  --utc-offset=UTC_OFFSET
+                        UTC offset for photos (defaults to 0)
+  -n NAME, --name=NAME  Name for collection; defaults to "Tagged Photos"
+  --img-width=IMGWIDTH  Width of landscape images in placemarks (defaults to
+                        400px)
+  --img-height=IMGHEIGHT
+                        Height of landscape images in placemarks(defaults to
+                        300px)
+

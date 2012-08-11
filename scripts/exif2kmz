@@ -1,0 +1,251 @@
+#!python
+
+# exif2kmz: Converts list of images with location EXIF tags to KMZ
+# Copyright (C) 2012  Alexander W Blocker
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import optparse, sys
+import zipfile
+from xml.dom.minidom import Document
+import pyexiv2
+import Image
+import StringIO
+
+gpstags = ['Exif.GPSInfo.GPSLatitudeRef', 'Exif.GPSInfo.GPSLatitude',
+           'Exif.GPSInfo.GPSLongitudeRef', 'Exif.GPSInfo.GPSLongitude',
+           'Exif.GPSInfo.GPSTimeStamp', 'Exif.GPSInfo.GPSDOP',
+           'Exif.GPSInfo.GPSImgDirectionRef', 'Exif.GPSInfo.GPSImgDirection']
+loctags = ['Exif.GPSInfo.GPSLatitude', 'Exif.GPSInfo.GPSLongitude']
+reftags = ['Exif.GPSInfo.GPSLatitudeRef','Exif.GPSInfo.GPSLongitudeRef']
+timetags = ['Exif.Photo.DateTimeOriginal']
+orientationtag = 'Exif.Image.Orientation'
+sizetags = ['Exif.Photo.PixelXDimension', 'Exif.Photo.PixelYDimension']
+
+def orientimg(img, orientation):
+    """Function to orient image based on EXIF orientation data.
+    Takes Image object and orientation code. Returns new Image object"""
+
+    # Rotate image based on orientation
+    # Orientation of 1 or 2 requires no action
+    if orientation in (3,4):
+        # Flip vertically
+        img = img.rotate(180)
+    elif orientation in (5,6):
+        # Rotate 90 deg clockwise
+        img = img.rotate(-90)
+    elif orientation in (7,8):
+        # Rotate 90 deg counter-clockwise
+        img = img.rotate(90)
+
+    # If orientation is in (2,4,5,7), flip horizontally
+    if orientation in (2,4,5,7):
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    return img
+
+
+def main(argv):
+    # Parse command line options
+    usage = ('Usage: %prog [options] infile1 [infile2 ...]\n\n'+
+             'Reads in images with GPS EXIF tags and outputs a KMZ file with '+
+             'a placemark for\neach image along with the images themselves')
+    parser = optparse.OptionParser(usage=usage)
+
+    parser.add_option('-o', dest='outfile', default='out.kmz',
+                      help='Output file for KMZ')
+    parser.add_option('--utc-offset', dest='utc_offset', type='int',
+                      default=0, help='UTC offset for photos (defaults to 0)')
+    parser.add_option('-n', '--name', dest='name', default='Tagged Photos',
+                      help='Name for collection; defaults to "Tagged Photos"')
+    parser.add_option('--img-width', dest='imgwidth', type='int', default=400,
+                      help='Width of landscape images in placemarks '+
+                      '(defaults to 400px)')
+    parser.add_option('--img-height', dest='imgheight', type='int', default=300,
+                      help='Height of landscape images in placemarks' +
+                      '(defaults to 300px)')
+    
+    options, args = parser.parse_args(argv)
+
+    if len(args) < 1:
+        print 'Error: Need at least 1 input file'
+        return 1
+
+    # Read EXIF GPS, time, orientation, and size tags
+    locs = []
+    times = []
+    orientations = []
+    relsizes = []
+    
+    # Iterate over input files
+    for infile in args:
+        # Attempt to read metadata
+        try:
+            img = pyexiv2.Image(infile)
+            img.readMetadata()
+        except:
+            continue
+        
+        # Check for, convert, and store location information
+        if all([x in img.exifKeys() for x in (loctags+reftags)]):
+            lat = [float(x.numerator)/x.denominator for x in img[loctags[0]]]
+            lat = sum([x/60**y for x,y in zip(lat,range(3))])
+            lon = [float(x.numerator)/x.denominator for x in img[loctags[1]]]
+            lon = sum([x/60**y for x,y in zip(lon,range(3))])
+
+            if img[reftags[0]]=='S':
+                lat = -lat
+            if img[reftags[1]]=='W':
+                lon = -lon
+
+            locs.append((lon,lat))
+        else:
+            locs.append(None)
+        
+        # Check for and store time information
+        if all([x in img.exifKeys() for x in timetags]):
+            times.append(img[timetags[0]])
+        else:
+            times.append(None)
+
+        # Check for and store orientation
+        if orientationtag in img.exifKeys():
+            orientations.append(img[orientationtag])
+        else:
+            orientations.append(1)
+
+        # Store relative size flag (width > height)
+        if img[sizetags[0]] > img[sizetags[1]]:
+            relsizes.append(1)
+        else:
+            relsizes.append(0)
+    
+    # Stop if there is no valid location information
+    if all([x==None for x in locs]):
+        print 'Error - no valid location metadata'
+        return 1
+    
+    # Setup XML output
+    doc = Document()
+
+    # Setup KML namespace & structure
+    kml = doc.createElement('kml')
+    kml.setAttribute('xmlns', 'http://www.opengis.net/kml/2.2')
+    doc.appendChild(kml)
+    doctag = doc.createElement('Document')
+    kml.appendChild(doctag)
+    docname = doc.createElement('name')
+    docnametxt = doc.createTextNode(options.name)
+    docname.appendChild(docnametxt)
+    doctag.appendChild(docname)
+
+    placemarks = []
+    # Iterate over location list
+    for i in range(len(locs)):
+        if locs[i] != None:
+            # Setup placemark
+            place = doc.createElement('Placemark')
+            
+            name = doc.createElement('name')
+            nametxt = doc.createTextNode('Photo %d' % (i+1))
+            name.appendChild(nametxt)
+            
+            # Create point with location information
+            point = doc.createElement('Point')
+            coords = doc.createElement('coordinates')
+            coordstxt = doc.createTextNode('%s,%s' % locs[i])
+            point.appendChild(coords)
+            coords.appendChild(coordstxt)
+
+            place.appendChild(name)
+            place.appendChild(point)
+
+            descripstr = ''
+            
+            # Add time and date information, if available
+            if times[i] != None:
+                descripstr = (descripstr + ('<p>Taken at %s (UTC %+d)</p>' %
+                              (times[i].strftime('%H:%M:%S, %A %b %d %Y'),
+                              options.utc_offset)))
+
+            # Add HTML for images with appropriate orientation
+            if ((orientations[i] in (1,2,3,4))*relsizes[i] or 
+                (orientations[i] in (5,6,7,8))*(1-relsizes[i])):
+                imgstr = ('<img src="images/img%d.jpg" width="%d" height="%d"/>'
+                          % (i,options.imgwidth,options.imgheight))
+            else:
+                imgstr = ('<img src="images/img%d.jpg" width="%d" height="%d"/>'
+                          % (i,options.imgheight,options.imgwidth))
+            
+            # Create CDATA section for timestamp and image
+            descripcdata = doc.createCDATASection('\n'.join([descripstr,
+                                                             imgstr]))
+            descrip = doc.createElement('description')
+            descrip.appendChild(descripcdata)
+            place.appendChild(descrip)
+            
+            # Add placemark to list
+            placemarks.append(place)
+
+    # Put together DOM
+    for place in placemarks:
+        doctag.appendChild(place)
+
+    # print doc.toprettyxml(indent='  ')
+
+    # Reorient images and store result to strings
+    imgstrs = []
+    for i in range(len(locs)):
+        # Setup temporary StringIO
+        tmpstrio = StringIO.StringIO()
+
+        # Open and reorient image
+        tmpimg = Image.open(args[i])
+        tmpimg = orientimg(tmpimg, orientations[i])
+
+        # Write image to string in JPEG format
+        tmpimg.save(tmpstrio, 'jpeg')
+        imgstrs.append(tmpstrio.getvalue())
+
+        # Close temporary StringIO object
+        tmpstrio.close()
+
+    del tmpstrio
+    del tmpimg
+
+
+    # Build kmz file
+    outkmz = zipfile.ZipFile(options.outfile, 'w')
+
+    # Write kml to doc.kml
+    outkmz.writestr('doc.kml', doc.toprettyxml(indent='  '))
+
+    # Add images to kmz
+    for i in range(len(imgstrs)):
+        outkmz.writestr('images/img%d.jpg' % i, imgstrs[i])
+
+    # Close archive
+    outkmz.close()
+
+    return 0
+
+
+if __name__=='__main__':
+    sys.exit(main(sys.argv[1:]))
+
